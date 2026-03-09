@@ -4,6 +4,8 @@ GraphSAGE edge classifier — waltertaya/aml-gnn-ibm-baseline-medium
 """
 
 import json
+from datetime import datetime, time as dtime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -15,7 +17,6 @@ from huggingface_hub import hf_hub_download
 # ── Constants ─────────────────────────────────────────────────────────────────
 HF_REPO_ID = "waltertaya/aml-gnn-ibm-baseline-medium"
 
-# Exact values present in the IBM AML dataset (used during training one-hot encoding)
 CURRENCIES = [
     "US Dollar", "Euro", "UK Pound", "Swiss Franc", "Yen",
     "Ruble", "Yuan", "Bitcoin", "Australian Dollar", "Canadian Dollar",
@@ -135,6 +136,20 @@ def load_model():
     return model, cfg, metrics
 
 
+# ── Timestamp parser: datetime string → hour + dayofweek ─────────────────────
+def parse_timestamp_column(series: pd.Series):
+    """
+    Returns (hour_series, dayofweek_series) from a raw timestamp column.
+    Handles: datetime strings, numeric step values (IBM dataset uses step=hour).
+    """
+    parsed = pd.to_datetime(series, errors="coerce")
+    if parsed.notna().sum() > len(series) * 0.5:
+        return parsed.dt.hour.fillna(12).astype(float), parsed.dt.dayofweek.fillna(0).astype(float)
+    # IBM dataset uses integer "step" = hours since simulation start
+    numeric = pd.to_numeric(series, errors="coerce").fillna(0)
+    return (numeric % 24).astype(float), ((numeric // 24) % 7).astype(float)
+
+
 # ── Feature engineering (mirrors notebook exactly) ───────────────────────────
 def build_features(df: pd.DataFrame):
     df = df.copy()
@@ -154,14 +169,17 @@ def build_features(df: pd.DataFrame):
     edge_cont["amount"] = np.log1p(
         pd.to_numeric(df["amount"], errors="coerce").fillna(0).clip(lower=0.0)
     )
-    edge_cont["hour"] = (
-        pd.to_numeric(df["hour"], errors="coerce").fillna(12) / 23.0
-        if "hour" in df.columns else 0.5
-    )
-    edge_cont["dayofweek"] = (
-        pd.to_numeric(df["dayofweek"], errors="coerce").fillna(0) / 6.0
-        if "dayofweek" in df.columns else 0.0
-    )
+
+    # hour and dayofweek — sourced from pre-parsed columns
+    if "hour" in df.columns:
+        edge_cont["hour"] = pd.to_numeric(df["hour"], errors="coerce").fillna(12) / 23.0
+    else:
+        edge_cont["hour"] = 0.5
+
+    if "dayofweek" in df.columns:
+        edge_cont["dayofweek"] = pd.to_numeric(df["dayofweek"], errors="coerce").fillna(0) / 6.0
+    else:
+        edge_cont["dayofweek"] = 0.0
 
     cat_cols = [c for c in ["currency", "payment_type"] if c in df.columns]
     if cat_cols:
@@ -209,7 +227,7 @@ def score_transactions(model, cfg, edge_index, edge_attr, node_x):
     return torch.sigmoid(logits).cpu().numpy()
 
 
-# ── Load model (runs once, cached) ───────────────────────────────────────────
+# ── Load model ────────────────────────────────────────────────────────────────
 try:
     model, cfg, stored_metrics = load_model()
 except Exception as e:
@@ -218,25 +236,26 @@ except Exception as e:
 
 model_threshold = cfg.get("best_threshold", 0.5)
 
-# ── Sidebar — threshold controls ──────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### Decision threshold")
     use_model_thr = st.checkbox(
         "Use model's saved threshold",
         value=True,
-        help=f"Threshold optimised on the validation set: {model_threshold:.3f}",
+        help=f"Threshold optimised on the validation set: {model_threshold * 100:.1f}%",
     )
     manual_thr = st.slider(
         "Manual threshold",
-        min_value=0.01,
-        max_value=0.99,
-        value=float(round(model_threshold, 2)),
-        step=0.01,
+        min_value=1,
+        max_value=99,
+        value=int(round(model_threshold * 100)),
+        step=1,
+        format="%d%%",
         disabled=use_model_thr,
         help="Increase to reduce false positives; decrease to increase recall.",
     )
-    threshold = model_threshold if use_model_thr else manual_thr
-    st.caption(f"Active threshold: **{threshold:.3f}**")
+    threshold = model_threshold if use_model_thr else manual_thr / 100.0
+    st.caption(f"Active threshold: **{threshold * 100:.1f}%**")
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("## AML Transaction Screening")
@@ -245,12 +264,11 @@ st.caption(
     "Upload a CSV or enter transactions manually to score them for suspicious activity."
 )
 
-# Model info
 with st.expander("Model information", expanded=False):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Architecture", "GraphSAGE")
     c2.metric("Hidden dim", cfg.get("hidden_dim", "—"))
-    c3.metric("Decision threshold", f"{threshold:.3f}")
+    c3.metric("Decision threshold", f"{threshold * 100:.1f}%")
     c4.metric("Trained on", "IBM HI-Medium")
     if stored_metrics.get("test_metrics"):
         tm = stored_metrics["test_metrics"]
@@ -270,24 +288,33 @@ df_input = None
 with tab_upload:
     st.caption(
         "Required columns: `From Account` (or `src`), `To Account` (or `dst`), `Amount Paid` (or `amount`). "
-        "Optional: `Payment Currency`, `Payment Format`, `Timestamp`."
+        "Optional: `Timestamp` (datetime or numeric step), `Payment Currency`, `Payment Format`."
     )
     uploaded = st.file_uploader("CSV file", type=["csv"], label_visibility="collapsed")
     if uploaded:
         try:
             df_input = pd.read_csv(uploaded)
             df_input.columns = [c.strip().lower().replace(" ", "_") for c in df_input.columns]
+
             alias_map = {
                 "from_account": "src", "originator": "src", "sender": "src",
                 "to_account": "dst", "beneficiary": "dst", "receiver": "dst",
                 "amount_paid": "amount", "transaction_amount": "amount", "amt": "amount",
                 "payment_currency": "currency", "receiving_currency": "currency",
                 "payment_format": "payment_type",
-                "timestamp": "hour", "step": "hour",
             }
             df_input = df_input.rename(
                 columns={k: v for k, v in alias_map.items() if k in df_input.columns}
             )
+
+            # Parse timestamp → hour + dayofweek (keep raw timestamp for display)
+            ts_col = next(
+                (c for c in ["timestamp", "step", "time", "date", "tran_date"] if c in df_input.columns),
+                None,
+            )
+            if ts_col:
+                df_input["hour"], df_input["dayofweek"] = parse_timestamp_column(df_input[ts_col])
+
             missing = {"src", "dst", "amount"} - set(df_input.columns)
             if missing:
                 st.error(f"Missing required columns: {missing}")
@@ -299,14 +326,15 @@ with tab_upload:
             st.error(f"Could not parse file: {e}")
 
 with tab_manual:
-    st.caption("Enter one transaction per row. Currency and payment type must match the training data values.")
+    st.caption("Enter one transaction per row.")
 
     n_rows = st.number_input("Number of transactions", min_value=1, max_value=50, value=4, step=1)
 
-    col_src, col_dst, col_amt, col_cur, col_pay = st.columns([2, 2, 1.5, 1.5, 1.5])
+    col_src, col_dst, col_amt, col_ts, col_cur, col_pay = st.columns([2, 2, 1.5, 2, 1.5, 1.5])
     col_src.markdown("**Source account**")
     col_dst.markdown("**Destination account**")
     col_amt.markdown("**Amount**")
+    col_ts.markdown("**Timestamp**")
     col_cur.markdown("**Currency**")
     col_pay.markdown("**Payment type**")
 
@@ -318,32 +346,58 @@ with tab_manual:
     defaults_pay = ["Wire", "Wire", "ACH", "Wire"]
 
     for i in range(int(n_rows)):
-        c1, c2, c3, c4, c5 = st.columns([2, 2, 1.5, 1.5, 1.5])
+        c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 1.5, 2, 1.5, 1.5])
         src = c1.text_input(
             f"src_{i}", value=defaults_src[i] if i < len(defaults_src) else f"ACC{i+1:03d}",
-            label_visibility="collapsed", key=f"src_{i}"
+            label_visibility="collapsed", key=f"src_{i}",
         )
         dst = c2.text_input(
             f"dst_{i}", value=defaults_dst[i] if i < len(defaults_dst) else f"ACC{i+2:03d}",
-            label_visibility="collapsed", key=f"dst_{i}"
+            label_visibility="collapsed", key=f"dst_{i}",
         )
         amt = c3.number_input(
             f"amt_{i}", value=defaults_amt[i] if i < len(defaults_amt) else 1000.0,
-            min_value=0.0, format="%.2f", label_visibility="collapsed", key=f"amt_{i}"
+            min_value=0.0, format="%.2f", label_visibility="collapsed", key=f"amt_{i}",
         )
-        cur = c4.selectbox(
+        ts = c4.datetime_input(
+            f"ts_{i}",
+            value=datetime.now().replace(second=0, microsecond=0),
+            label_visibility="collapsed", key=f"ts_{i}",
+        ) if hasattr(st, "datetime_input") else c4.text_input(
+            f"ts_{i}", value=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            label_visibility="collapsed", key=f"ts_{i}",
+        )
+        cur = c5.selectbox(
             f"cur_{i}",
             options=CURRENCIES,
             index=CURRENCIES.index(defaults_cur[i]) if i < len(defaults_cur) else 0,
-            label_visibility="collapsed", key=f"cur_{i}"
+            label_visibility="collapsed", key=f"cur_{i}",
         )
-        pay = c5.selectbox(
+        pay = c6.selectbox(
             f"pay_{i}",
             options=PAYMENT_TYPES,
             index=PAYMENT_TYPES.index(defaults_pay[i]) if i < len(defaults_pay) else 0,
-            label_visibility="collapsed", key=f"pay_{i}"
+            label_visibility="collapsed", key=f"pay_{i}",
         )
-        rows.append({"src": src, "dst": dst, "amount": amt, "currency": cur, "payment_type": pay})
+
+        # Parse timestamp to hour + dayofweek
+        if isinstance(ts, datetime):
+            hour_val = float(ts.hour)
+            dow_val = float(ts.weekday())
+        else:
+            try:
+                dt = datetime.fromisoformat(str(ts))
+                hour_val = float(dt.hour)
+                dow_val = float(dt.weekday())
+            except Exception:
+                hour_val = 12.0
+                dow_val = 0.0
+
+        rows.append({
+            "src": src, "dst": dst, "amount": amt,
+            "hour": hour_val, "dayofweek": dow_val,
+            "currency": cur, "payment_type": pay,
+        })
 
     if st.button("Score transactions", type="primary"):
         df_input = pd.DataFrame(rows)
@@ -366,7 +420,7 @@ if df_input is not None and len(df_input) > 0:
         if col in df_input.columns:
             result_df[col] = df_input[col].values
 
-    result_df["risk_score"] = probs
+    result_df["risk_score"] = probs          # raw float kept for threshold comparison
     result_df["flagged"] = (probs >= threshold).astype(bool)
     result_df = result_df.sort_values("risk_score", ascending=False).reset_index(drop=True)
 
@@ -378,12 +432,12 @@ if df_input is not None and len(df_input) > 0:
     m1.metric("Transactions scored", f"{n_total:,}")
     m2.metric("Flagged", f"{n_flagged:,}")
     m3.metric("Clear", f"{n_clear:,}")
-    m4.metric("Threshold", f"{threshold:.3f}")
+    m4.metric("Threshold", f"{threshold * 100:.1f}%")
 
     if n_flagged > 0:
         st.markdown(
             f'<div class="alert-high"><strong>{n_flagged} transaction{"s" if n_flagged != 1 else ""} '
-            f'flagged</strong> above the {threshold:.3f} risk threshold.</div>',
+            f'flagged</strong> above the {threshold * 100:.1f}% risk threshold.</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -395,7 +449,7 @@ if df_input is not None and len(df_input) > 0:
     def render_table(df):
         d = df.copy()
         d["amount"] = pd.to_numeric(d["amount"], errors="coerce").map("{:,.2f}".format)
-        d["risk_score"] = d["risk_score"].map("{:.4f}".format)
+        d["risk_score"] = d["risk_score"].map(lambda v: f"{v * 100:.2f}%")
         d["flagged"] = d["flagged"].map(lambda x: "Yes" if x else "No")
         st.dataframe(d, use_container_width=True, hide_index=True)
 
@@ -417,7 +471,7 @@ if df_input is not None and len(df_input) > 0:
     with hist_col:
         counts, edges = np.histogram(probs, bins=20, range=(0, 1))
         hist_df = pd.DataFrame({
-            "bin": [f"{edges[i]:.2f}–{edges[i+1]:.2f}" for i in range(len(counts))],
+            "bin": [f"{edges[i]*100:.0f}–{edges[i+1]*100:.0f}%" for i in range(len(counts))],
             "count": counts,
         })
         st.bar_chart(hist_df.set_index("bin"), use_container_width=True, height=220)
@@ -434,13 +488,17 @@ if df_input is not None and len(df_input) > 0:
             .head(10).reset_index()
         )
         acct_summary.columns = ["Account", "Max risk"]
-        acct_summary["Max risk"] = acct_summary["Max risk"].map("{:.4f}".format)
+        acct_summary["Max risk"] = acct_summary["Max risk"].map(lambda v: f"{v * 100:.2f}%")
         st.dataframe(acct_summary, use_container_width=True, hide_index=True)
 
     st.markdown("---")
+    # Export with percentage in CSV too
+    export_df = result_df.copy()
+    export_df["risk_score"] = export_df["risk_score"].map(lambda v: f"{v * 100:.2f}%")
+    export_df["flagged"] = export_df["flagged"].map(lambda x: "Yes" if x else "No")
     st.download_button(
         label="Download results as CSV",
-        data=result_df.to_csv(index=False).encode(),
+        data=export_df.to_csv(index=False).encode(),
         file_name="aml_scored_transactions.csv",
         mime="text/csv",
     )
