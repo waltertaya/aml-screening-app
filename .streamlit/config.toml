@@ -1,0 +1,7 @@
+[server]
+headless = true
+enableCORS = false
+
+[theme]
+base = "light"
+font = "sans serif"

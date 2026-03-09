@@ -1,0 +1,11 @@
+--find-links https://data.pyg.org/whl/torch-2.3.0+cpu.html
+
+streamlit>=1.35.0
+torch==2.3.0
+torch-geometric==2.5.3
+torch-scatter==2.1.2
+torch-sparse==0.6.18
+torch-cluster==1.6.3
+huggingface_hub>=0.22.0
+pandas>=2.0.0
+numpy>=1.24.0
